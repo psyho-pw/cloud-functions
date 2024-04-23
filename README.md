@@ -11,8 +11,13 @@ go install github.com/GoogleCloudPlatform/functions-framework-go/funcframework
 ```cd resize-image```
 #### run command & test
 ```bash 
+# local binary
 make start
-````
+
+# local container
+make run-docker
+```
+
 #### make HTTP POST call
 ```bash
 curl --location 'localhost:8080/projects/sayho-general/topics/test' \
@@ -25,8 +30,14 @@ curl --location 'localhost:8080/projects/sayho-general/topics/test' \
 --data '{
     "message": {
         "data": {
-            "objectName": "test.jpg"
+            ...payload key: value here
         }
     }
 }'
+```
+
+### Deploy via gcloud CLI
+```bash 
+# local container
+make deploy
 ```

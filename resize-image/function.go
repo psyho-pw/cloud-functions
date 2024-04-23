@@ -7,17 +7,22 @@ import (
 	"fmt"
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
 	"github.com/cloudevents/sdk-go/v2/event"
-	"github.com/nfnt/resize"
+	"github.com/disintegration/imaging"
 	"github.com/oracle/oci-go-sdk/common"
 	"github.com/oracle/oci-go-sdk/objectstorage"
 	"image"
-	"image/jpeg"
 	"io"
 	"log"
 	"os"
+	"sync"
 )
 
 var client *objectstorage.ObjectStorageClient
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
 
 func createObjectStorageClient() (*objectstorage.ObjectStorageClient, error) {
 	tenancy := os.Getenv("OCI_TENANCY")
@@ -36,8 +41,6 @@ func createObjectStorageClient() (*objectstorage.ObjectStorageClient, error) {
 		string(privateKey),
 		&passPhrase,
 	)
-
-	//provider := common.ConfigurationProviderEnvironmentVariables("OCI", passPhrase)
 
 	objectStorageClient, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(provider)
 	if err != nil {
@@ -62,25 +65,27 @@ func init() {
 // See the documentation for more details:
 // https://cloud.google.com/eventarc/docs/cloudevents#pubsub
 type MessagePublishedData struct {
-	Message PubSubMessage `json:"message"`
+	Message *PubSubMessage `json:"message"`
 }
 
 // PubSubMessage is the payload of a Pub/Sub event.
 // See the documentation for more details:
 // https://cloud.google.com/pubsub/docs/reference/rest/v1/PubsubMessage
 type PubSubMessage struct {
-	Data Payload `json:"data"`
+	Data *Payload `json:"data"`
 }
 
 type Payload struct {
-	ObjectName string `json:"objectName"`
+	ObjectName   string `json:"objectName"`
+	TargetName   string `json:"targetName"`
+	TargetWidth  int    `json:"targetWidth"`
+	TargetHeight int    `json:"targetHeight"`
 }
 
 // resizeImage resizes the input image and returns the resized image
-func resizeImage(img image.Image) image.Image {
-	// Implement image resizing logic using the nfnt/resize package
-	resizedImg := resize.Resize(200, 0, img, resize.Lanczos3)
-	return resizedImg
+func resizeImage(img image.Image, width int, height int) image.Image {
+	// Implement image resizing logic using the disintegration/imaging package
+	return imaging.Resize(img, width, height, imaging.Box)
 }
 
 // resizeImage consumes a CloudEvent message and extracts the Pub/Sub message.
@@ -94,30 +99,34 @@ func handlePubSubMessage(ctx context.Context, e event.Event) error {
 	namespace := os.Getenv("OCI_NAMESPACE")
 	bucket := os.Getenv("OCI_BUCKET")
 
-	// Decode base64 encoded image data
-	imageData, err := readFromOCIObjectStorage(ctx, namespace, bucket, msg.Message.Data.ObjectName)
+	// Read the image from OCI Object Storage as a stream
+	imageStream, err := readFromOCIObjectStorage(ctx, namespace, bucket, msg.Message.Data.ObjectName)
 	if err != nil {
 		return fmt.Errorf("error reading image from OCI Object Storage: %v", err)
 	}
+	defer func(imageStream io.ReadCloser) {
+		_ = imageStream.Close()
+	}(imageStream)
 
 	// Decode the image
-	img, _, err := image.Decode(bytes.NewReader(imageData))
+	img, err := imaging.Decode(imageStream)
 	if err != nil {
 		return fmt.Errorf("error decoding image: %v", err)
 	}
 
 	// Resize the image
-	resizedImg := resizeImage(img)
+	resizedImg := resizeImage(img, msg.Message.Data.TargetWidth, msg.Message.Data.TargetHeight)
 
 	// Save the resized image to OCI Object storage
-	if err := saveToOCIObjectStorage(ctx, resizedImg, namespace, bucket, "resized-image.jpg"); err != nil {
+	if err := saveToOCIObjectStorage(ctx, &resizedImg, namespace, bucket, msg.Message.Data.TargetName); err != nil {
 		return fmt.Errorf("error saving resized image to OCI Object Storage: %v", err)
 	}
 
 	return nil
 }
 
-func readFromOCIObjectStorage(ctx context.Context, namespaceName, bucketName, objectName string) ([]byte, error) {
+// readFromOCIObjectStorage reads the image from OCI Object Storage as a stream
+func readFromOCIObjectStorage(ctx context.Context, namespaceName, bucketName, objectName string) (io.ReadCloser, error) {
 	getObjectRequest := objectstorage.GetObjectRequest{
 		NamespaceName: &namespaceName,
 		BucketName:    &bucketName,
@@ -128,34 +137,29 @@ func readFromOCIObjectStorage(ctx context.Context, namespaceName, bucketName, ob
 	if err != nil {
 		return nil, err
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			log.Fatalf("%+v", err)
-		}
-	}(getObjectResponse.HTTPResponse().Body)
 
-	var buf bytes.Buffer
-	_, err = io.Copy(&buf, getObjectResponse.HTTPResponse().Body)
-	if err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
+	return getObjectResponse.HTTPResponse().Body, nil
 }
 
-func saveToOCIObjectStorage(ctx context.Context, img image.Image, namespaceName, bucketName, objectName string) error {
-	// 이미지 데이터를 바이트 슬라이스로 인코딩
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, img, nil); err != nil {
+// saveToOCIObjectStorage saves the image to OCI Object Storage as a stream
+func saveToOCIObjectStorage(ctx context.Context, img *image.Image, namespaceName, bucketName, objectName string) error {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		// 너무 큰 버퍼는 해제
+		if buf.Cap() > 10*1024*1024 {
+			return
+		}
+		buf.Reset()
+		bufPool.Put(buf)
+	}()
+
+	if err := imaging.Encode(buf, *img, imaging.JPEG, imaging.JPEGQuality(80)); err != nil {
 		return err
 	}
-	imageData := buf.Bytes()
-
-	// bytes.NewReader(imageData)를 io.ReadCloser로 변환
-	imageReader := io.NopCloser(bytes.NewReader(imageData))
-	// OCI Object Storage에 이미지 업로드
-	contentLength := int64(len(imageData))
+	// upload image to OCI Object Storage
+	imageReader := io.NopCloser(bytes.NewReader(buf.Bytes()))
+	contentLength := int64(buf.Len())
 	putObjectRequest := objectstorage.PutObjectRequest{
 		NamespaceName: &namespaceName,
 		BucketName:    &bucketName,

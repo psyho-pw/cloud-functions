@@ -5,8 +5,7 @@ go 1.22.2
 require (
 	github.com/GoogleCloudPlatform/functions-framework-go v1.8.1
 	github.com/cloudevents/sdk-go/v2 v2.15.2
-	github.com/joho/godotenv v1.5.1
-	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
+	github.com/disintegration/imaging v1.6.2
 	github.com/oracle/oci-go-sdk v24.3.0+incompatible
 )
 
@@ -19,4 +18,5 @@ require (
 	go.uber.org/atomic v1.4.0 // indirect
 	go.uber.org/multierr v1.1.0 // indirect
 	go.uber.org/zap v1.10.0 // indirect
+	golang.org/x/image v0.0.0-20220302094943-723b81ca9867 // indirect
 )
